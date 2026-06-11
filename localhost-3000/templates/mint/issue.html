@@ -1,0 +1,472 @@
+{% extends "base.html" %}
+{% block title %}{{ issue.slug }} — {{ j.name }} — Minting{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="journal-header">
+    <h1>{{ issue.slug }}</h1>
+    <span class="muted">
+      <a href="{{ url_for('mint.journal_view', slug=j.slug) }}">← {{ j.name }}</a>
+    </span>
+  </div>
+  <div class="meta-grid">
+    <div><span class="label">Source PDF</span>
+      <span>
+        {% if issue.has_issue_pdf %}
+          <code>{{ issue.issue_pdf.name }}</code>
+        {% else %}
+          <em class="muted">none (per-article-only)</em>
+        {% endif %}
+      </span></div>
+    <div><span class="label">Total pages</span>
+      <span>{% if page_count %}{{ page_count }}{% else %}—{% endif %}</span></div>
+    <div><span class="label">Sidecar</span>
+      <span>
+        {% if issue.has_sidecar %}<code>{{ issue.sidecar_path.name }}</code> (saved)
+        {% else %}new (not yet saved){% endif %}
+      </span></div>
+    <div><span class="label">Per-article PDFs</span>
+      <span>{{ issue.split_count }} in <code>pdfs/{{ issue.slug }}/</code></span></div>
+  </div>
+
+  {% if issue.has_issue_pdf %}
+  <div class="action-row">
+    <a class="btn" target="_blank" rel="noopener"
+       href="{{ url_for('mint.serve_issue_pdf', slug=j.slug, issue_slug=issue.slug) }}">
+      Open full PDF ↗
+    </a>
+    <span class="muted" style="font-size: 0.85rem;">
+      …or use the visual editor below: click pages to mark article starts / ToC / skip.
+    </span>
+  </div>
+  {% else %}
+  <p class="muted" style="margin-top: 0.5rem; font-size: 0.9rem;">
+    No whole-issue PDF on disk — this issue's per-article PDFs live in
+    <code>pdfs/{{ issue.slug }}/</code> already, so the visual editor
+    and splitter aren't applicable. Edit article rows below directly,
+    then save the sidecar.
+  </p>
+  {% endif %}
+</div>
+
+{% if issue.has_issue_pdf %}
+<div class="card">
+  <div class="journal-header">
+    <h2 style="margin: 0; font-size: 1.05rem;">Visual editor</h2>
+    <span class="muted" style="font-size: 0.85rem;">
+      {{ page_count }} pages total
+    </span>
+  </div>
+
+  <p class="muted" style="font-size: 0.85rem;">
+    Pick a mode, then click a page. Click again to clear. The article
+    list below auto-derives from the article-start markers; ToC and
+    skip markers are saved alongside.
+  </p>
+
+  <div class="visual-mode-bar">
+    <button type="button" class="mode-btn active" data-mode="zoom">🔍 Zoom</button>
+    <button type="button" class="mode-btn" data-mode="article">🆕 Article start</button>
+    <button type="button" class="mode-btn" data-mode="toc">📋 ToC</button>
+    <button type="button" class="mode-btn" data-mode="skip">⏭️ Skip</button>
+    <span class="muted" style="margin-left: auto; font-size: 0.85rem;"
+          id="visual-status">no changes</span>
+  </div>
+
+  <div id="thumb-grid" class="thumb-grid"
+       data-page-count="{{ page_count }}"
+       data-thumb-url="{{ url_for('mint.serve_thumb', slug=j.slug, issue_slug=issue.slug, page=0)[:-5] }}"
+       data-initial-toc="{{ sidecar.toc_pages|tojson }}"
+       data-initial-skip="{{ sidecar.skip_pages|tojson }}"
+       data-initial-starts="{{ sidecar.articles|map(attribute='start_page')|list|tojson }}">
+    {# JS populates this grid #}
+  </div>
+
+  <form id="visual-save-form" method="POST"
+        action="{{ url_for('mint.visual_save', slug=j.slug, issue_slug=issue.slug) }}"
+        style="margin-top: 0.75rem; display: flex; gap: 0.5rem; align-items: center;">
+    <input type="hidden" name="assignments" id="visual-assignments" value="">
+    <button type="submit" class="btn btn-primary">Save page assignments</button>
+    <span class="muted" style="font-size: 0.85rem;">
+      Article rows below will be rebuilt from the clicked starts (text fields preserved where pages still match).
+    </span>
+  </form>
+
+  <!-- Zoom overlay -->
+  <div id="page-zoom" class="page-zoom" hidden onclick="this.hidden = true;">
+    <img id="page-zoom-img" alt="">
+  </div>
+
+  {% if sidecar.articles | length == 0 and not sidecar.toc_pages %}
+  <form method="POST" action="{{ url_for('mint.issue_infer', slug=j.slug, issue_slug=issue.slug) }}"
+        style="margin-top: 0.5rem;">
+    <button type="submit" class="btn">Auto-populate from embedded ToC →</button>
+    <span class="muted" style="margin-left: 0.5rem; font-size: 0.85rem;">
+      Tries the PDF's own outline first, then a regex-scrape of pages 1-3
+      (assumes the PDF has a readable text layer — often false on scanned issues).
+    </span>
+  </form>
+  {% endif %}
+</div>
+{% endif %}{# end visual editor — only for issues with a whole-issue PDF #}
+
+{% if issue.has_issue_pdf %}
+<div class="card">
+  <h2 style="margin-top: 0; font-size: 1.05rem;">Table of contents (OCR)</h2>
+  <p class="muted" style="font-size: 0.9rem;">
+    For scanned issues, mark which pages of the issue PDF contain the
+    table of contents and run a forced OCR pass on them. The parser then
+    splits each ToC line into title / authors / start-page and pre-fills
+    the article rows below.
+  </p>
+
+  <form method="POST" action="{{ url_for('mint.issue_ocr_toc', slug=j.slug, issue_slug=issue.slug) }}"
+        class="wizard-form">
+    <label class="block" style="max-width: 26rem;">
+      <span class="label">ToC page numbers</span>
+      <input type="text" name="toc_pages"
+             placeholder="1, 2, 3   or   1-3   or   2, 4"
+             value="{{ sidecar.toc_pages | join(', ') }}"
+             style="width: 100%; padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: 3px; font: inherit;">
+      <small class="muted">1-based page numbers within the {{ page_count }}-page issue PDF.</small>
+    </label>
+
+    <div class="action-row" style="margin-top: 0.6rem;">
+      <button type="submit" class="btn btn-primary">Run OCR + parse →</button>
+      <button type="submit" class="btn"
+              formaction="{{ url_for('mint.issue_save_toc_pages', slug=j.slug, issue_slug=issue.slug) }}">
+        Save pages only
+      </button>
+      {% if sidecar.toc_ocr_text %}
+      <button type="submit" class="btn"
+              formaction="{{ url_for('mint.issue_reparse', slug=j.slug, issue_slug=issue.slug) }}">
+        Re-parse cached OCR
+      </button>
+      {% endif %}
+    </div>
+  </form>
+
+  {% if sidecar.toc_ocr_text %}
+  <details style="margin-top: 0.75rem;">
+    <summary class="muted" style="cursor: pointer; font-size: 0.85rem;">
+      Cached OCR text ({{ sidecar.toc_ocr_text | length }} chars)
+    </summary>
+    <pre class="ocr-text">{{ sidecar.toc_ocr_text }}</pre>
+  </details>
+  {% endif %}
+</div>
+{% endif %}{# end ToC OCR card — only when whole-issue PDF exists #}
+
+<form method="POST" action="{{ url_for('mint.issue_save', slug=j.slug, issue_slug=issue.slug) }}"
+      class="wizard-form">
+
+  <div class="card">
+    <h2 style="margin-top: 0; font-size: 1.05rem;">Issue metadata</h2>
+    <div class="form-row">
+      <label class="block">
+        <span class="label">Volume</span>
+        <input type="number" name="volume" value="{{ sidecar.volume or '' }}" min="1" max="9999"
+               style="width: 100%; padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: 3px; font: inherit;">
+      </label>
+      <label class="block">
+        <span class="label">Issue</span>
+        <input type="number" name="issue" value="{{ sidecar.issue or '' }}" min="0" max="999"
+               style="width: 100%; padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: 3px; font: inherit;">
+      </label>
+      <label class="block">
+        <span class="label">Year</span>
+        <input type="number" name="year" value="{{ sidecar.year or '' }}" min="1900" max="2100"
+               style="width: 100%; padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: 3px; font: inherit;">
+      </label>
+      <label class="block">
+        <span class="label">Month (1-12)</span>
+        <input type="number" name="month" value="{{ sidecar.month or '' }}" min="0" max="12"
+               style="width: 100%; padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: 3px; font: inherit;">
+      </label>
+    </div>
+    <label class="block">
+      <span class="label">Issue title (optional)</span>
+      <input type="text" name="issue_title" value="{{ sidecar.issue_title }}"
+             placeholder="Fall 2025 special issue on…"
+             style="width: 100%; padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: 3px; font: inherit;">
+    </label>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top: 0; font-size: 1.05rem;">Articles</h2>
+    <p class="muted" style="font-size: 0.85rem;">
+      Each row becomes one per-article PDF on split, and one
+      <code>&lt;journal_article&gt;</code> in the content-registration XML.
+      Page numbers are 1-based and inclusive. Two-column journals where
+      article N ends on the same page article N+1 starts — set article N's
+      <em>end_page</em> equal to article N+1's <em>start_page</em>; the
+      shared page will appear in both per-article PDFs.
+    </p>
+
+    <table class="article-rows">
+      <thead>
+        <tr>
+          <th>Start</th>
+          <th>End</th>
+          <th>Filename</th>
+          <th>Title</th>
+          <th>Authors (given / surname)</th>
+        </tr>
+      </thead>
+      <tbody id="article-rows-tbody">
+        {% set num_existing = sidecar.articles | length %}
+        {% set num_show = (num_existing + 3) if num_existing > 0 else 4 %}
+        {% for i in range(num_show) %}
+          {% set art = sidecar.articles[i] if i < num_existing else none %}
+          <tr class="article-row" data-index="{{ i }}">
+            <td>
+              <input type="number" name="articles-{{ i }}-start_page"
+                     value="{{ art.start_page if art and art.start_page else '' }}"
+                     min="1" max="{{ page_count }}"
+                     style="width: 5em; padding: 0.2rem 0.3rem;">
+            </td>
+            <td>
+              <input type="number" name="articles-{{ i }}-end_page"
+                     value="{{ art.end_page if art and art.end_page else '' }}"
+                     min="1" max="{{ page_count }}"
+                     style="width: 5em; padding: 0.2rem 0.3rem;">
+            </td>
+            <td>
+              <input type="text" name="articles-{{ i }}-filename"
+                     value="{{ art.filename if art else '' }}"
+                     placeholder="surname.pdf"
+                     style="width: 12em; padding: 0.2rem 0.3rem;">
+            </td>
+            <td>
+              <input type="text" name="articles-{{ i }}-title"
+                     value="{{ art.title if art else '' }}"
+                     style="width: 100%; padding: 0.2rem 0.3rem;">
+            </td>
+            <td>
+              {% set num_authors = (art.authors | length) if art else 0 %}
+              {% set show_authors = (num_authors + 1) if num_authors > 0 else 2 %}
+              {% for j_a in range(show_authors) %}
+                {% set au = art.authors[j_a] if art and j_a < num_authors else none %}
+                <div style="display: flex; gap: 0.2rem; margin-bottom: 0.15rem;">
+                  <input type="text" name="articles-{{ i }}-author-{{ j_a }}-given"
+                         value="{{ au.given if au else '' }}"
+                         placeholder="given"
+                         style="width: 7em; padding: 0.15rem 0.3rem; font-size: 0.85rem;">
+                  <input type="text" name="articles-{{ i }}-author-{{ j_a }}-surname"
+                         value="{{ au.surname if au else '' }}"
+                         placeholder="surname"
+                         style="width: 8em; padding: 0.15rem 0.3rem; font-size: 0.85rem;">
+                </div>
+              {% endfor %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="form-actions" style="display: flex; gap: 0.75rem; align-items: center;">
+      <button type="submit" class="btn btn-primary">Save sidecar</button>
+      <span class="muted" style="font-size: 0.85rem;">
+        Blank rows are ignored. Sort order doesn't matter — articles are
+        re-sequenced by start page on save.
+      </span>
+    </div>
+  </div>
+</form>
+
+{% if issue.has_issue_pdf %}
+<div class="card">
+  <h2 style="margin-top: 0; font-size: 1.05rem;">Split this issue into per-article PDFs</h2>
+  <p class="muted" style="font-size: 0.85rem;">
+    Slices <code>{{ issue.issue_pdf.name }}</code> into per-article PDFs in
+    <code>pdfs/{{ issue.slug }}/</code> using the saved page boundaries above.
+    Run after saving the sidecar.
+  </p>
+  <form method="POST" action="{{ url_for('mint.issue_split_route', slug=j.slug, issue_slug=issue.slug) }}"
+        style="margin-top: 0.5rem;">
+    <label style="display: inline-block; margin-right: 0.75rem; font-size: 0.9rem;">
+      <input type="checkbox" name="overwrite"> Overwrite existing per-article PDFs
+    </label>
+    <button type="submit" class="btn">Split now</button>
+  </form>
+</div>
+{% endif %}
+
+<style>
+  .article-rows { font-size: 0.85rem; width: 100%; }
+  .article-rows th { background: #f4f1ec; padding: 0.3rem 0.4rem; font-size: 0.75rem;
+                     text-transform: uppercase; letter-spacing: 0.04em;
+                     font-family: -apple-system, system-ui, sans-serif; }
+  .article-rows td { padding: 0.3rem 0.4rem; vertical-align: top;
+                     border-bottom: 1px solid var(--border); }
+  .article-rows input { font: inherit; border: 1px solid var(--border);
+                        border-radius: 3px; }
+  .wizard-form .form-row { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 0.5rem; }
+  .wizard-form .block { display: block; margin: 0.3rem 0; }
+  .action-row { display: flex; gap: 0.5rem; align-items: center;
+                flex-wrap: wrap; margin-top: 0.5rem; }
+  .ocr-text { margin-top: 0.5rem; padding: 0.6rem 0.8rem;
+              background: #1d1916; color: #f4f1ec; border-radius: 4px;
+              font-family: ui-monospace, Consolas, monospace;
+              font-size: 0.78rem; white-space: pre-wrap; max-height: 360px;
+              overflow: auto; }
+
+  /* Visual editor */
+  .visual-mode-bar { display: flex; gap: 0.4rem; align-items: center;
+                     padding: 0.5rem 0; margin-bottom: 0.5rem;
+                     border-bottom: 1px dashed var(--border); }
+  .mode-btn { background: #f4f1ec; color: var(--fg); border: 1px solid var(--border);
+              padding: 0.3rem 0.7rem; border-radius: 4px; cursor: pointer;
+              font: inherit; font-size: 0.88rem; }
+  .mode-btn:hover { background: #ebe3d4; }
+  .mode-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .thumb-grid { display: grid; gap: 0.5rem;
+                grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+                margin-top: 0.5rem; }
+  .thumb { position: relative; cursor: pointer;
+           border: 3px solid transparent; border-radius: 3px;
+           background: #f4f1ec; padding: 0.2rem; transition: transform 0.05s; }
+  .thumb:hover { transform: translateY(-1px); border-color: #b8a98a; }
+  .thumb img { width: 100%; display: block; border: 1px solid var(--border); }
+  .thumb .pg { position: absolute; top: 0.3rem; left: 0.3rem;
+               background: rgba(0,0,0,0.7); color: #fff; padding: 0 0.4rem;
+               border-radius: 3px; font-family: -apple-system, system-ui, sans-serif;
+               font-size: 0.72rem; font-weight: bold; }
+  .thumb .tag { position: absolute; top: 0.3rem; right: 0.3rem;
+                padding: 0.1rem 0.4rem; border-radius: 3px;
+                font-family: -apple-system, system-ui, sans-serif;
+                font-size: 0.72rem; font-weight: bold; }
+  .thumb.is-article-start { border-color: #4caf50; }
+  .thumb.is-article-start .tag { background: #4caf50; color: #fff; }
+  .thumb.is-toc          { border-color: #2196f3; }
+  .thumb.is-toc .tag     { background: #2196f3; color: #fff; }
+  .thumb.is-skip         { border-color: #9e9e9e; opacity: 0.55; }
+  .thumb.is-skip .tag    { background: #9e9e9e; color: #fff; }
+
+  .page-zoom { position: fixed; inset: 0; background: rgba(0,0,0,0.85);
+               display: flex; align-items: center; justify-content: center;
+               z-index: 999; cursor: zoom-out; }
+  /* HTML `hidden` attribute is the source of truth; CSS must respect it
+     even though .page-zoom sets `display: flex`. */
+  .page-zoom[hidden] { display: none !important; }
+  .page-zoom img { max-width: 92vw; max-height: 92vh; box-shadow: 0 0 30px rgba(0,0,0,0.5); }
+
+  @media (max-width: 700px) { .wizard-form .form-row { grid-template-columns: 1fr 1fr; } }
+</style>
+
+<script>
+(function() {
+  const grid = document.getElementById("thumb-grid");
+  if (!grid) return;
+  const pageCount = parseInt(grid.dataset.pageCount || "0", 10);
+  // data-thumb-url comes in shape "/mint/<slug>/issue/<iss>/thumb/" — append <n>.png
+  const thumbBase = grid.dataset.thumbUrl;
+  const initToc = JSON.parse(grid.dataset.initialToc || "[]");
+  const initSkip = JSON.parse(grid.dataset.initialSkip || "[]");
+  const initStarts = JSON.parse(grid.dataset.initialStarts || "[]");
+
+  // State: page → "article" | "toc" | "skip" | undefined
+  const state = {};
+  initToc.forEach(p => state[p] = "toc");
+  initSkip.forEach(p => state[p] = "skip");
+  initStarts.forEach(p => state[p] = "article");
+
+  let mode = "zoom";
+  const statusEl = document.getElementById("visual-status");
+  function updateStatus() {
+    const counts = {article: 0, toc: 0, skip: 0};
+    Object.values(state).forEach(v => { if (counts[v] !== undefined) counts[v]++; });
+    statusEl.textContent =
+      `${counts.article} article start(s), ${counts.toc} ToC, ${counts.skip} skip`;
+  }
+
+  function setMode(m) {
+    mode = m;
+    document.querySelectorAll(".mode-btn").forEach(b => {
+      b.classList.toggle("active", b.dataset.mode === m);
+    });
+  }
+  document.querySelectorAll(".mode-btn").forEach(b => {
+    b.addEventListener("click", () => setMode(b.dataset.mode));
+  });
+
+  function applyClass(thumb, page) {
+    thumb.classList.remove("is-article-start", "is-toc", "is-skip");
+    const tag = thumb.querySelector(".tag");
+    tag.textContent = "";
+    const s = state[page];
+    if (s === "article") { thumb.classList.add("is-article-start"); tag.textContent = "START"; }
+    else if (s === "toc")   { thumb.classList.add("is-toc"); tag.textContent = "ToC"; }
+    else if (s === "skip")  { thumb.classList.add("is-skip"); tag.textContent = "SKIP"; }
+  }
+
+  const zoomEl = document.getElementById("page-zoom");
+  const zoomImg = document.getElementById("page-zoom-img");
+
+  function buildThumb(page) {
+    const t = document.createElement("div");
+    t.className = "thumb";
+    t.dataset.page = String(page);
+    const pgLabel = document.createElement("span");
+    pgLabel.className = "pg";
+    pgLabel.textContent = `p${page}`;
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.alt = `page ${page}`;
+    img.src = `${thumbBase}${page}.png`;
+    t.appendChild(pgLabel);
+    t.appendChild(tag);
+    t.appendChild(img);
+    applyClass(t, page);
+
+    t.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      if (mode === "zoom") {
+        // Higher-res preview overlay
+        zoomImg.src = `${thumbBase}${page}.png?dpi=220`;
+        zoomEl.hidden = false;
+        return;
+      }
+      // Toggle: clicking a page already in the same mode clears it;
+      // otherwise overwrite with the current mode.
+      if (state[page] === mode) {
+        delete state[page];
+      } else {
+        state[page] = mode;
+      }
+      applyClass(t, page);
+      updateStatus();
+    });
+    return t;
+  }
+
+  // Build grid
+  for (let p = 1; p <= pageCount; p++) {
+    grid.appendChild(buildThumb(p));
+  }
+  updateStatus();
+
+  // On submit, serialize state into the hidden field
+  const form = document.getElementById("visual-save-form");
+  form.addEventListener("submit", () => {
+    const toc = [], skip = [], starts = [];
+    for (const [k, v] of Object.entries(state)) {
+      const p = parseInt(k, 10);
+      if (v === "toc")     toc.push(p);
+      else if (v === "skip")    skip.push(p);
+      else if (v === "article") starts.push(p);
+    }
+    toc.sort((a,b) => a - b);
+    skip.sort((a,b) => a - b);
+    starts.sort((a,b) => a - b);
+    document.getElementById("visual-assignments").value = JSON.stringify({
+      toc, skip, article_starts: starts,
+    });
+  });
+})();
+</script>
+{% endblock %}

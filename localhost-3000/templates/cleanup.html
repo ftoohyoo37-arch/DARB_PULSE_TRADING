@@ -1,0 +1,744 @@
+{% extends "base.html" %}
+{% block title %}Cleanup — Audit #{{ meta.id }}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Cleanup — Audit #{{ meta.id }}</h1>
+  <p class="muted">
+    {% if meta.batch_id %}
+    <a href="{{ url_for('batch_view', batch_id=meta.batch_id) }}">&larr; Batch: {{ meta.batch_name }}</a> &middot;
+    {% endif %}
+    <a href="{{ url_for('report', audit_id=meta.id) }}">&larr; back to report</a> &middot; {{ meta.filename }}
+  </p>
+  <div class="meta-grid">
+    <div><span class="label">Cards</span><span>{{ cards|length }}</span></div>
+    <div><span class="label">Pending</span><span>{{ summary.pending }}</span></div>
+    <div><span class="label">Keep</span><span>{{ summary.keep }}</span></div>
+    <div><span class="label">Delete</span><span class="sev-error">{{ summary.delete }}</span></div>
+    <div><span class="label">Split</span><span>{{ summary.split }} (→ {{ summary.split_into }} new)</span></div>
+  </div>
+  <div class="download-row">
+    <a class="btn btn-primary" href="{{ url_for('cleanup_download', audit_id=meta.id) }}">
+      &darr; Download cleaned XML
+    </a>
+    <span class="muted">
+      Applies all saved decisions (keep / delete / split) to the original deposit.
+      File saves to your browser's Downloads folder as
+      <code>{{ meta.filename.rsplit('.',1)[0] }}.cleaned.xml</code>.
+    </span>
+  </div>
+</section>
+
+<section class="card auto-decide-card">
+  <h3>Bulk auto-decide</h3>
+  <p class="muted">
+    Two passes: (1) any card flagged by <code>paragraph_shaped</code> is auto-marked <b>delete</b> immediately
+    (no Crossref needed — these are body-text false citations).
+    (2) For the rest, run a Crossref match on every proposed chunk; cards where <b>all</b> chunks score ≥ threshold
+    are auto-marked <b>split</b> (multi-chunk) or <b>keep</b> (single-chunk; the audit warning was a false positive).
+    Cards with low/no Crossref confidence are left for manual review. Already-decided cards are skipped unless re-check is on.
+  </p>
+  <div class="auto-controls">
+    <label>Min Crossref score:
+      <input type="number" id="auto-threshold" value="50" min="0" max="500" step="5">
+    </label>
+    <label>Below threshold:
+      <select id="auto-fallback">
+        <option value="pending" selected>leave pending (manual review)</option>
+        <option value="keep">auto-keep (safe — treat warning as false positive)</option>
+        <option value="delete">auto-delete (aggressive — treat low-confidence as garbage)</option>
+      </select>
+    </label>
+    <label>Duplicate-year fallback:
+      <select id="auto-year-fallback">
+        <option value="keep_second" selected>keep second year (recommended for Chicago author-date)</option>
+        <option value="keep_first">keep first year</option>
+        <option value="crossref_only">Crossref only (safest; leaves unresolved cases pending)</option>
+      </select>
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="auto-recheck"> re-check already-decided cards
+    </label>
+    <button class="btn" id="auto-run">Run auto-decide</button>
+    <button class="btn" id="auto-cancel" disabled>Cancel</button>
+  </div>
+  <div id="auto-progress" class="muted"></div>
+</section>
+
+<section class="card filter-card">
+  <h3>Filter cards</h3>
+  <div class="filter-controls">
+    <label>Status:
+      <select id="filter-status">
+        <option value="all">All</option>
+        <option value="pending">Pending only</option>
+        <option value="decided">Any decision</option>
+        <option value="auto">Auto-decided only</option>
+        <option value="manual">Manually decided only</option>
+      </select>
+    </label>
+    <label>Action:
+      <select id="filter-action">
+        <option value="all">All actions</option>
+        <option value="keep">Keep</option>
+        <option value="delete">Delete</option>
+        <option value="split">Split</option>
+      </select>
+    </label>
+    <label>Sort:
+      <select id="filter-sort">
+        <option value="pending" selected>Pending first, decided at bottom</option>
+        <option value="line">By line number</option>
+        <option value="action">By action (delete → split → keep → pending)</option>
+        <option value="rule">By rule (paragraph_shaped first)</option>
+      </select>
+    </label>
+    {% if parent_dois %}
+    <label>Article (parent DOI):
+      <select id="filter-doi">
+        <option value="">all articles ({{ parent_dois|length }})</option>
+        {% for d in parent_dois %}
+          <option value="{{ d }}">{{ d }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    {% endif %}
+    <span id="filter-count" class="muted"></span>
+    <span class="muted" style="margin-left:auto"><kbd>?</kbd> shortcuts</span>
+  </div>
+</section>
+
+<div id="kbd-help" class="kbd-help" style="display:none">
+  <h3>Keyboard shortcuts</h3>
+  <table>
+    <tr><th>Key</th><th>Action</th></tr>
+    <tr><td><kbd>j</kbd></td><td>Focus next card</td></tr>
+    <tr><td><kbd>k</kbd></td><td>Focus previous card</td></tr>
+    <tr><td><kbd>K</kbd></td><td>Mark focused card as <b>Keep</b></td></tr>
+    <tr><td><kbd>D</kbd></td><td>Mark focused card as <b>Delete</b> (no confirm)</td></tr>
+    <tr><td><kbd>S</kbd></td><td>Toggle the <b>Split</b> editor on focused card</td></tr>
+    <tr><td><kbd>?</kbd></td><td>Show / hide this help</td></tr>
+    <tr><td><kbd>Esc</kbd></td><td>Hide this help</td></tr>
+  </table>
+  <p class="muted">Shortcuts are disabled while you're typing in a textarea or input.</p>
+</div>
+
+{% for c in cards %}
+{% set src = (c.decision.notes if c.decision and c.decision.notes else 'manual') %}
+<section class="card cleanup-card"
+         data-line="{{ c.line }}"
+         data-key="{{ c.citation_key or '' }}"
+         data-rules="{{ c.rule_ids|join(',') }}"
+         data-action="{{ c.decision.action if c.decision else 'pending' }}"
+         data-source="{{ src if c.decision else '' }}"
+         data-citation-type="{{ c.citation_type or '' }}"
+         data-full-text="{{ c.full_text }}"
+         data-parent-doi="{{ c.parent_doi or '' }}"
+         tabindex="0">
+  <div class="cleanup-head">
+    <code>{{ c.citation_key or 'no key' }}</code> <span class="muted">line {{ c.line }}</span>
+    {% if 'paragraph_shaped' in c.rule_ids %}<span class="badge badge-error" style="margin-left:0.5rem">paragraph-shaped</span>{% endif %}
+    {% if c.citation_type %}<span class="badge badge-info" style="margin-left:0.5rem">type: {{ c.citation_type }}</span>{% endif %}
+    {% if c.decision %}<span class="badge badge-{{ {'keep':'info','delete':'error','split':'warning'}[c.decision.action] }}">{{ src }}: {{ c.decision.action }}</span>{% endif %}
+  </div>
+  <div class="cleanup-issues">
+    {% for m in c.messages %}<div class="muted">⚠ {{ m }}</div>{% endfor %}
+  </div>
+  <div class="cleanup-orig"><b>Original:</b> {{ c.full_text }}</div>
+
+  <div class="cleanup-actions">
+    <button class="btn act-keep" type="button">Keep as-is</button>
+    <button class="btn act-delete" type="button">Delete (garbage)</button>
+    <button class="btn act-split" type="button">Split into pieces ({{ c.proposed_splits|length }} proposed)</button>
+  </div>
+
+  <div class="cleanup-splits"
+       data-proposed='{{ c.proposed_splits|tojson }}'
+       {% if c.decision and c.decision.action == 'split' %}style="display:block"{% else %}style="display:none"{% endif %}>
+    <p class="muted">Edit each chunk to clean it up, click "Match in Crossref" to verify, then "Save split".</p>
+    <details class="diff-toggle">
+      <summary class="muted">Show diff vs. original</summary>
+      <div class="diff-pane"></div>
+    </details>
+    <div class="chunk-list">
+      {% set initial = (c.decision.split_chunks if c.decision and c.decision.action == 'split' else c.proposed_splits) %}
+      {% for chunk in initial %}
+      <div class="chunk">
+        <textarea rows="3" class="chunk-text">{{ chunk }}</textarea>
+        <div class="chunk-actions">
+          <button class="btn small chunk-match" type="button">Match in Crossref</button>
+          <button class="btn small chunk-remove" type="button">Remove this chunk</button>
+        </div>
+        <div class="chunk-result muted">—</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="split-actions">
+      <button class="btn small chunk-add" type="button">+ Add chunk</button>
+      <button class="btn act-save-split" type="button">Save split</button>
+    </div>
+  </div>
+
+  <div class="cleanup-status muted"></div>
+</section>
+{% else %}
+<section class="card"><p class="muted">No flagged citations to clean up. Nice deposit.</p></section>
+{% endfor %}
+
+<script>
+const auditId = {{ meta.id }};
+const matchUrl = `/cleanup/${auditId}/match`;
+const decisionUrl = `/cleanup/${auditId}/decision`;
+
+function postJSON(url, body) {
+  return fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  }).then(r => r.json());
+}
+
+// ---- Diff helpers (used by per-card diff pane) ----
+function escapeHtmlDiff(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+function tokenize(s) {
+  // Split on whitespace boundaries while keeping the whitespace as separators.
+  return s.split(/(\s+)/);
+}
+function highlightDiffTokens(pane, orig, cleaned) {
+  const oTokens = new Set(tokenize(orig).filter(t => t.trim().length > 0));
+  const cTokens = new Set(tokenize(cleaned).filter(t => t.trim().length > 0));
+  const cols = pane.querySelectorAll('.diff-col');
+  if (cols.length !== 2) return;
+  // Original column: highlight tokens that don't appear in cleaned (RED — removed)
+  cols[0].innerHTML = `<h4>Original</h4>` + tokenize(orig).map(t => {
+    if (t.trim() && !cTokens.has(t)) return `<span class="diff-rm">${escapeHtmlDiff(t)}</span>`;
+    return escapeHtmlDiff(t);
+  }).join('');
+  // Cleaned column: highlight tokens that don't appear in original (GREEN — added/substituted)
+  cols[1].innerHTML = `<h4>Proposed</h4>` + tokenize(cleaned).map(t => {
+    if (t.trim() && !oTokens.has(t)) return `<span class="diff-add">${escapeHtmlDiff(t)}</span>`;
+    return escapeHtmlDiff(t);
+  }).join('');
+}
+
+function setStatus(card, msg, isError) {
+  const s = card.querySelector('.cleanup-status');
+  s.textContent = msg;
+  s.style.color = isError ? 'var(--error-fg)' : 'var(--ok-fg)';
+}
+
+function renderMatch(resultDiv, m) {
+  if (!m || m.empty) { resultDiv.textContent = 'No Crossref match.'; return; }
+  if (m.error) { resultDiv.textContent = 'Crossref error: ' + m.error; return; }
+  const conf = m.confidence ? ` (conf: ${m.confidence}, score: ${m.score?.toFixed(1) || '?'})` : '';
+  resultDiv.innerHTML = `<b>Match${conf}:</b> ${m.authors || '?'} (${m.year || '?'}). <i>${m.title || ''}</i>. ${m.container || ''}. <a href="${m.url || '#'}" target="_blank">${m.doi || ''}</a>`;
+}
+
+// ---- Helpers shared with bulk auto-decide ----
+
+function applyDecisionUI(card, action, source) {
+  const head = card.querySelector('.cleanup-head');
+  // Drop only the prior decision badge (preserve any "paragraph-shaped" rule badge)
+  head.querySelectorAll('.badge').forEach(b => {
+    if (b.textContent.includes(':')) b.remove();
+  });
+  const badge = document.createElement('span');
+  const cls = action === 'delete' ? 'error' : (action === 'split' ? 'warning' : 'info');
+  badge.className = `badge badge-${cls}`;
+  badge.textContent = `${source}: ${action}`;
+  head.appendChild(badge);
+  card.dataset.action = action;
+  card.dataset.source = source;
+}
+
+// ---- Bulk auto-decide ----
+let autoCancel = false;
+
+document.getElementById('auto-cancel').addEventListener('click', () => { autoCancel = true; });
+
+document.getElementById('auto-run').addEventListener('click', async () => {
+  const threshold = parseFloat(document.getElementById('auto-threshold').value) || 0;
+  const recheck = document.getElementById('auto-recheck').checked;
+  const fallback = document.getElementById('auto-fallback').value; // 'pending' | 'keep' | 'delete'
+  const yearFallback = document.getElementById('auto-year-fallback').value; // 'keep_second' | 'keep_first' | 'crossref_only'
+  const cards = Array.from(document.querySelectorAll('.cleanup-card'));
+  const progress = document.getElementById('auto-progress');
+  const runBtn = document.getElementById('auto-run');
+  const cancelBtn = document.getElementById('auto-cancel');
+  runBtn.disabled = true;
+  cancelBtn.disabled = false;
+  autoCancel = false;
+  let autoDeleted = 0, acceptedSplit = 0, acceptedKeep = 0, lowConf = 0, skipped = 0, fallbackApplied = 0;
+
+  // ---- Pass 1: auto-delete obvious garbage (paragraphs, footnotes) ----
+  progress.textContent = 'Pass 1: scanning for paragraph-shaped citations and footnote artifacts…';
+  for (const card of cards) {
+    if (autoCancel) break;
+    const decided = card.dataset.action && card.dataset.action !== 'pending';
+    if (decided && !recheck) { continue; }
+    const rules = (card.dataset.rules || '').split(',').filter(Boolean);
+    const isParagraph = rules.includes('paragraph_shaped');
+    const isFootnote  = rules.includes('footnote_artifact');
+    if (!isParagraph && !isFootnote) continue;
+    const reason = isFootnote ? 'footnote_artifact' : 'paragraph_shaped';
+    await postJSON(decisionUrl, {
+      line: parseInt(card.dataset.line),
+      citation_key: card.dataset.key || null,
+      action: 'delete',
+      decided_by: 'auto',
+      notes: `auto-deleted (${reason})`,
+    });
+    applyDecisionUI(card, 'delete', 'auto');
+    autoDeleted++;
+  }
+
+  // ---- Pass 1.3: auto-resolve duplicate-year citations via Crossref ----
+  // Citations like "Ore, Ersula. 2019. 2015. \"Title.\" ..." have a
+  // duplicate publication year. We strip both years, query Crossref for
+  // the canonical year, and only auto-rewrite when Crossref confidently
+  // returns a year matching one of the two candidates.
+  progress.textContent = 'Pass 1.3: resolving duplicate-year citations via Crossref…';
+  let autoFixedYears = 0;
+  const yearFixUrl = `/cleanup/${auditId}/fix_duplicate_year`;
+  for (const card of cards) {
+    if (autoCancel) break;
+    const decided = card.dataset.action && card.dataset.action !== 'pending';
+    if (decided && !recheck) { continue; }
+    const rules = (card.dataset.rules || '').split(',').filter(Boolean);
+    if (!rules.includes('duplicate_year_tokens')) continue;
+    const fullText = card.dataset.fullText || '';
+    if (!fullText) continue;
+    progress.textContent = `Pass 1.3: resolving duplicate-year card line ${card.dataset.line}…`;
+    const r = await postJSON(yearFixUrl, {
+      text: fullText,
+      min_score: threshold,
+      fallback: yearFallback,
+    });
+    // Be polite to Crossref only when we actually queried it (different-year cases).
+    if (r && r.method && r.method !== 'dedup_same_year') {
+      await new Promise(r => setTimeout(r, 150));
+    }
+    if (!r || !r.fixed) continue;
+    await postJSON(decisionUrl, {
+      line: parseInt(card.dataset.line),
+      citation_key: card.dataset.key || null,
+      action: 'split',
+      split_chunks: [r.fixed],
+      decided_by: 'auto',
+      notes: `auto-fixed duplicate years (${r.method}: kept ${r.kept_year}, dropped ${r.dropped_year})`,
+    });
+    applyDecisionUI(card, 'split', 'auto');
+    autoFixedYears++;
+  }
+
+  // ---- Pass 1.4: auto-strip incomplete structured fields ----
+  // Citations flagged by incomplete_structured_citation have structured
+  // metadata that doesn't meet Crossref's "at least one of" business
+  // rules (e.g., <article_title> but no <journal_title>/<issn>). The
+  // fix: drop ALL structured fields, keep only <unstructured_citation>.
+  // The xml_writer's split action does exactly this when given a single
+  // chunk — it replaces the whole <citation> with a new one containing
+  // just <key> and <unstructured_citation>.
+  progress.textContent = 'Pass 1.4: stripping incomplete structured fields…';
+  let autoStripStructured = 0;
+  for (const card of cards) {
+    if (autoCancel) break;
+    const decided = card.dataset.action && card.dataset.action !== 'pending';
+    if (decided && !recheck) { continue; }
+    const rules = (card.dataset.rules || '').split(',').filter(Boolean);
+    if (!rules.includes('incomplete_structured_citation')) continue;
+    const fullText = card.dataset.fullText || '';
+    if (!fullText) continue;
+    await postJSON(decisionUrl, {
+      line: parseInt(card.dataset.line),
+      citation_key: card.dataset.key || null,
+      action: 'split',
+      split_chunks: [fullText],
+      decided_by: 'auto',
+      notes: 'auto-stripped (incomplete_structured_citation)',
+    });
+    applyDecisionUI(card, 'split', 'auto');
+    autoStripStructured++;
+  }
+
+  // ---- Pass 1.5: auto-strip trailing artifacts (footers, Notes sections) ----
+  // Citations flagged by journal_footer_suffix had a footer like
+  // "Reflections | Volume 24, Issue 2, Spring 2025" appended to them.
+  // Citations flagged by notes_section_appended had a "Notes ↑1 …"
+  // section glued onto the last works-cited entry. In both cases the
+  // splitter has already stripped the artifact, so the proposed_splits
+  // hold just the cleaned real citation — save them automatically.
+  progress.textContent = 'Pass 1.5: auto-stripping trailing artifacts (footers, Notes sections)…';
+  let autoStripped = 0;
+  for (const card of cards) {
+    if (autoCancel) break;
+    const decided = card.dataset.action && card.dataset.action !== 'pending';
+    if (decided && !recheck) { continue; }
+    const rules = (card.dataset.rules || '').split(',').filter(Boolean);
+    const isFooter = rules.includes('journal_footer_suffix');
+    const isNotes  = rules.includes('notes_section_appended');
+    if (!isFooter && !isNotes) continue;
+    const splitsBlock = card.querySelector('.cleanup-splits');
+    const chunks = JSON.parse(splitsBlock.dataset.proposed || '[]');
+    if (chunks.length === 0) continue;
+    const reason = isNotes ? 'notes_section_appended' : 'journal_footer_suffix';
+    await postJSON(decisionUrl, {
+      line: parseInt(card.dataset.line),
+      citation_key: card.dataset.key || null,
+      action: 'split',
+      split_chunks: chunks,
+      decided_by: 'auto',
+      notes: `auto-stripped (${reason})`,
+    });
+    applyDecisionUI(card, 'split', 'auto');
+    autoStripped++;
+  }
+
+  // ---- Pass 1.7: auto-keep recognized non-Crossref-indexed types ----
+  // Conference presentations, news/website articles, and software/code
+  // repos won't match Crossref's index — skip the round-trip and keep them.
+  progress.textContent = 'Pass 1.7: auto-keeping recognized non-Crossref types…';
+  let autoKeptType = 0;
+  for (const card of cards) {
+    if (autoCancel) break;
+    const decided = card.dataset.action && card.dataset.action !== 'pending';
+    if (decided && !recheck) { continue; }
+    const ctype = card.dataset.citationType;
+    if (!ctype) continue;
+    await postJSON(decisionUrl, {
+      line: parseInt(card.dataset.line),
+      citation_key: card.dataset.key || null,
+      action: 'keep',
+      decided_by: 'auto',
+      notes: `auto-kept (${ctype})`,
+    });
+    applyDecisionUI(card, 'keep', 'auto');
+    autoKeptType++;
+  }
+
+  // ---- Pass 2: Crossref-verified split/keep ----
+  for (let i = 0; i < cards.length; i++) {
+    if (autoCancel) { progress.textContent += ' [cancelled]'; break; }
+    const card = cards[i];
+
+    const decided = card.dataset.action && card.dataset.action !== 'pending';
+    if (decided && !recheck) { skipped++; continue; }
+
+    const splitsBlock = card.querySelector('.cleanup-splits');
+    const chunks = JSON.parse(splitsBlock.dataset.proposed || '[]');
+    if (chunks.length === 0) { skipped++; continue; }
+
+    progress.textContent = `Pass 2: card ${i+1}/${cards.length} — querying Crossref for ${chunks.length} chunk(s)…`;
+    card.style.outline = '2px solid var(--accent)';
+
+    const matches = [];
+    let allConfident = true;
+    for (const chunk of chunks) {
+      const m = await postJSON(matchUrl, {text: chunk});
+      matches.push(m);
+      const score = (m && !m.empty && !m.error) ? (m.score || 0) : 0;
+      if (score < threshold) { allConfident = false; }
+      await new Promise(r => setTimeout(r, 150));
+    }
+    card.style.outline = '';
+
+    if (!allConfident) {
+      lowConf++;
+      // Apply fallback action if configured
+      if (fallback !== 'pending') {
+        await postJSON(decisionUrl, {
+          line: parseInt(card.dataset.line),
+          citation_key: card.dataset.key || null,
+          action: fallback,
+          decided_by: 'auto',
+        });
+        applyDecisionUI(card, fallback, 'auto');
+        fallbackApplied++;
+      }
+      continue;
+    }
+
+    const action = chunks.length === 1 ? 'keep' : 'split';
+    const body = {
+      line: parseInt(card.dataset.line),
+      citation_key: card.dataset.key || null,
+      action,
+      decided_by: 'auto',
+    };
+    if (action === 'split') {
+      body.split_chunks = chunks;
+      body.crossref_data = matches;
+    }
+    await postJSON(decisionUrl, body);
+    applyDecisionUI(card, action, 'auto');
+    if (action === 'split') acceptedSplit++; else acceptedKeep++;
+  }
+
+  const lowConfMsg = fallback === 'pending'
+    ? `<b>${lowConf}</b> left for manual review (low/no Crossref confidence)`
+    : `<b>${fallbackApplied}</b> low-confidence cards auto-marked <b>${fallback}</b>`;
+  progress.innerHTML =
+    `Done. Auto-deleted <b>${autoDeleted}</b> paragraph-shaped, ` +
+    `auto-fixed <b>${autoFixedYears}</b> duplicate-year citations (Crossref-resolved), ` +
+    `auto-stripped <b>${autoStripStructured}</b> incomplete-structured citations, ` +
+    `auto-stripped <b>${autoStripped}</b> journal page footers / Notes sections, ` +
+    `auto-kept <b>${autoKeptType}</b> recognized non-Crossref types (conference / website / software), ` +
+    `auto-accepted <b>${acceptedSplit}</b> split(s) and <b>${acceptedKeep}</b> keep(s); ` +
+    `${lowConfMsg}; skipped <b>${skipped}</b>. ` +
+    `<a href="">Reload</a> to see updated chunk text in the split editors.`;
+  runBtn.disabled = false;
+  cancelBtn.disabled = true;
+  applyFilters();
+});
+
+// ---- Filter & sort ----
+function applyFilters() {
+  const status = document.getElementById('filter-status').value;
+  const action = document.getElementById('filter-action').value;
+  const sort = document.getElementById('filter-sort').value;
+  const doiSel = document.getElementById('filter-doi');
+  const doi = doiSel ? doiSel.value : '';
+  const cards = Array.from(document.querySelectorAll('.cleanup-card'));
+  let visible = 0;
+
+  for (const card of cards) {
+    const a = card.dataset.action || 'pending';
+    const s = card.dataset.source || '';
+    const cd = card.dataset.parentDoi || '';
+    let show = true;
+    if (status === 'pending' && a !== 'pending') show = false;
+    if (status === 'decided' && a === 'pending') show = false;
+    if (status === 'auto' && s !== 'auto') show = false;
+    if (status === 'manual' && s !== 'manual') show = false;
+    if (action !== 'all' && a !== action) show = false;
+    if (doi && cd !== doi) show = false;
+    card.style.display = show ? '' : 'none';
+    if (show) visible++;
+  }
+
+  // Sort visible cards
+  const main = document.querySelector('main');
+  const sortKeys = {
+    pending: c => (c.dataset.action && c.dataset.action !== 'pending') ? 1 : 0,
+    line:    c => parseInt(c.dataset.line || 0),
+    action:  c => ({delete: 0, split: 1, keep: 2, pending: 3}[c.dataset.action || 'pending']),
+    rule:    c => ((c.dataset.rules || '').includes('paragraph_shaped') ? 0 : 1),
+  };
+  const fn = sortKeys[sort];
+  if (fn) {
+    // Sort with a stable secondary by line number so pending cards stay
+    // in their natural source-order while floating to the top.
+    cards.sort((x, y) => {
+      const d = fn(x) - fn(y);
+      if (d !== 0) return d;
+      return parseInt(x.dataset.line || 0) - parseInt(y.dataset.line || 0);
+    });
+    cards.forEach(c => main.appendChild(c));
+  }
+
+  document.getElementById('filter-count').textContent =
+    `Showing ${visible} of ${cards.length}`;
+}
+
+['filter-status', 'filter-action', 'filter-sort', 'filter-doi'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', applyFilters);
+});
+applyFilters();
+
+// ---- Apply-to-similar batch action ----
+// After a manual decision is saved, scan for other PENDING cards whose
+// first 50 chars (whitespace-normalized) match the decided card's prefix.
+// Show a non-modal banner offering one-click batch application.
+function _normPrefix(text, n=50) {
+  return (text || '').replace(/\s+/g, ' ').trim().slice(0, n).toLowerCase();
+}
+function offerApplyToSimilar(card, action) {
+  const prefix = _normPrefix(card.dataset.fullText);
+  if (prefix.length < 20) return;  // too short to be a useful similarity key
+  const candidates = Array.from(document.querySelectorAll('.cleanup-card')).filter(c => {
+    if (c === card) return false;
+    if (c.dataset.action && c.dataset.action !== 'pending') return false;
+    return _normPrefix(c.dataset.fullText) === prefix;
+  });
+  if (candidates.length === 0) return;
+  const banner = document.createElement('div');
+  banner.className = 'similar-banner';
+  banner.innerHTML = `Found <b>${candidates.length}</b> other pending card(s) with the same opening text. ` +
+    `<button class="btn small" data-yes>Apply <b>${action}</b> to all ${candidates.length}</button> ` +
+    `<button class="btn small" data-no>Dismiss</button>`;
+  card.parentNode.insertBefore(banner, card.nextSibling);
+  banner.querySelector('[data-no]').addEventListener('click', () => banner.remove());
+  banner.querySelector('[data-yes]').addEventListener('click', async () => {
+    banner.querySelectorAll('button').forEach(b => b.disabled = true);
+    let done = 0;
+    for (const c of candidates) {
+      await postJSON(decisionUrl, {
+        line: parseInt(c.dataset.line),
+        citation_key: c.dataset.key || null,
+        action,
+        decided_by: 'manual',
+        notes: 'apply-to-similar batch',
+      });
+      applyDecisionUI(c, action, 'manual');
+      done++;
+    }
+    banner.innerHTML = `<span class="muted">Applied <b>${action}</b> to ${done} similar card(s).</span>`;
+    applyFilters();
+    setTimeout(() => banner.remove(), 4000);
+  });
+}
+
+// Wire offerApplyToSimilar into the existing manual action handlers by
+// hooking applyDecisionUI: we observe each call by re-wiring the buttons
+// in a delegate on document.
+document.addEventListener('click', (ev) => {
+  const target = ev.target;
+  if (!(target instanceof HTMLElement)) return;
+  const card = target.closest('.cleanup-card');
+  if (!card) return;
+  let action = null;
+  if (target.classList.contains('act-keep'))   action = 'keep';
+  if (target.classList.contains('act-delete')) action = 'delete';
+  // Don't offer batch on split (chunks differ per citation)
+  if (action) {
+    setTimeout(() => offerApplyToSimilar(card, action), 200);  // wait for save
+  }
+});
+
+// ---- Keyboard shortcuts ----
+let focusedCard = null;
+function setFocusedCard(card) {
+  if (focusedCard) focusedCard.classList.remove('cleanup-card-focused');
+  focusedCard = card;
+  if (card) {
+    card.classList.add('cleanup-card-focused');
+    card.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+  }
+}
+function visibleCards() {
+  return Array.from(document.querySelectorAll('.cleanup-card')).filter(c => c.style.display !== 'none');
+}
+function moveFocus(delta) {
+  const list = visibleCards();
+  if (list.length === 0) return;
+  const idx = focusedCard ? list.indexOf(focusedCard) : -1;
+  const next = list[Math.max(0, Math.min(list.length - 1, idx + delta))];
+  setFocusedCard(next);
+}
+const helpEl = document.getElementById('kbd-help');
+function toggleHelp() { helpEl.style.display = helpEl.style.display === 'none' ? 'block' : 'none'; }
+
+document.addEventListener('keydown', (ev) => {
+  // Don't intercept when user is typing in a form field.
+  const t = ev.target;
+  if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.tagName === 'SELECT')) return;
+  if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+
+  if (ev.key === '?') { ev.preventDefault(); toggleHelp(); return; }
+  if (ev.key === 'Escape') { helpEl.style.display = 'none'; return; }
+  if (ev.key === 'j') { ev.preventDefault(); moveFocus(+1); return; }
+  if (ev.key === 'k') { ev.preventDefault(); moveFocus(-1); return; }
+  if (!focusedCard) return;
+  if (ev.key === 'K') { ev.preventDefault(); focusedCard.querySelector('.act-keep')?.click(); return; }
+  if (ev.key === 'D') { ev.preventDefault(); focusedCard.querySelector('.act-delete')?.click(); return; }
+  if (ev.key === 'S') { ev.preventDefault(); focusedCard.querySelector('.act-split')?.click(); return; }
+});
+
+document.querySelectorAll('.cleanup-card').forEach(card => {
+  const line = parseInt(card.dataset.line);
+  const key = card.dataset.key || null;
+  const splitsBlock = card.querySelector('.cleanup-splits');
+  const chunkList = card.querySelector('.chunk-list');
+
+  function chunkTexts() {
+    return Array.from(chunkList.querySelectorAll('.chunk-text')).map(t => t.value.trim()).filter(Boolean);
+  }
+  function crossrefData() {
+    return Array.from(chunkList.querySelectorAll('.chunk')).map(div => div._match || null);
+  }
+
+  card.querySelector('.act-keep').addEventListener('click', () => {
+    splitsBlock.style.display = 'none';
+    postJSON(decisionUrl, {line, citation_key: key, action: 'keep', decided_by: 'manual'})
+      .then(() => { setStatus(card, 'Saved: keep'); applyDecisionUI(card, 'keep', 'manual'); applyFilters(); });
+  });
+
+  card.querySelector('.act-delete').addEventListener('click', () => {
+    if (!confirm('Mark this citation for deletion from the cleaned XML?')) return;
+    splitsBlock.style.display = 'none';
+    postJSON(decisionUrl, {line, citation_key: key, action: 'delete', decided_by: 'manual'})
+      .then(() => { setStatus(card, 'Saved: delete'); applyDecisionUI(card, 'delete', 'manual'); applyFilters(); });
+  });
+
+  card.querySelector('.act-split').addEventListener('click', () => {
+    splitsBlock.style.display = splitsBlock.style.display === 'block' ? 'none' : 'block';
+  });
+
+  card.querySelector('.act-save-split').addEventListener('click', () => {
+    const chunks = chunkTexts();
+    if (chunks.length < 1) { setStatus(card, 'Need at least one chunk.', true); return; }
+    postJSON(decisionUrl, {
+      line, citation_key: key, action: 'split',
+      split_chunks: chunks, crossref_data: crossrefData(),
+      decided_by: 'manual',
+    }).then(() => { setStatus(card, `Saved: split into ${chunks.length}`); applyDecisionUI(card, 'split', 'manual'); applyFilters(); });
+  });
+
+  function bindChunk(chunkDiv) {
+    chunkDiv.querySelector('.chunk-match').addEventListener('click', () => {
+      const text = chunkDiv.querySelector('.chunk-text').value.trim();
+      const result = chunkDiv.querySelector('.chunk-result');
+      if (!text) { result.textContent = 'Empty.'; return; }
+      result.textContent = 'Querying Crossref…';
+      postJSON(matchUrl, {text}).then(m => {
+        chunkDiv._match = m;
+        renderMatch(result, m);
+      });
+    });
+    chunkDiv.querySelector('.chunk-remove').addEventListener('click', () => {
+      chunkDiv.remove();
+    });
+  }
+
+  chunkList.querySelectorAll('.chunk').forEach(bindChunk);
+
+  // Diff pane: when the user opens the <details>, render a token-level
+  // visual diff between the original full text and the joined cleaned
+  // chunks. Re-renders on every textarea input so the user sees changes
+  // live as they edit.
+  const diffPane = card.querySelector('.diff-pane');
+  function renderDiff() {
+    const orig = card.dataset.fullText || '';
+    const cleaned = chunkTexts().join(' ');
+    diffPane.innerHTML = `
+      <div class="diff-col"><h4>Original</h4>${escapeHtmlDiff(orig)}</div>
+      <div class="diff-col"><h4>Proposed</h4>${escapeHtmlDiff(cleaned)}</div>
+    `;
+    // Highlight tokens that differ between the two
+    highlightDiffTokens(diffPane, orig, cleaned);
+  }
+  card.querySelector('.diff-toggle')?.addEventListener('toggle', renderDiff);
+  chunkList.addEventListener('input', () => {
+    if (card.querySelector('.diff-toggle[open]')) renderDiff();
+  });
+
+  card.querySelector('.chunk-add').addEventListener('click', () => {
+    const div = document.createElement('div');
+    div.className = 'chunk';
+    div.innerHTML = `
+      <textarea rows="3" class="chunk-text"></textarea>
+      <div class="chunk-actions">
+        <button class="btn small chunk-match" type="button">Match in Crossref</button>
+        <button class="btn small chunk-remove" type="button">Remove this chunk</button>
+      </div>
+      <div class="chunk-result muted">—</div>`;
+    chunkList.appendChild(div);
+    bindChunk(div);
+  });
+});
+</script>
+{% endblock %}
